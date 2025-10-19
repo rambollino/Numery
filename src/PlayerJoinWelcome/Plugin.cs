@@ -2,6 +2,7 @@ using PluginAPI.Core;
 using PluginAPI.Core.Attributes;
 using PluginAPI.Enums;
 using PluginAPI.Events;
+using PlayerJoinWelcome.Services;
 
 namespace PlayerJoinWelcome
 {
@@ -11,6 +12,13 @@ namespace PlayerJoinWelcome
         private void OnLoad()
         {
             EventManager.RegisterEvents(this);
+            VipService.Instance.Initialize();
+        }
+        
+        [PluginUnload]
+        private void OnUnload()
+        {
+            VipService.Instance.Shutdown();
         }
 
         [PluginEvent(ServerEventType.PlayerJoined)]
@@ -18,6 +26,7 @@ namespace PlayerJoinWelcome
         {
             Log.Info($"New Player Joined: {ev.Player.Nickname}");
             ev.Player.ReceiveHint("Witaj na serwerze! Zapoznaj się z zasadami.", 7f);
+            VipService.Instance.TryApplyOnJoin(ev.Player);
         }
     }
 }
