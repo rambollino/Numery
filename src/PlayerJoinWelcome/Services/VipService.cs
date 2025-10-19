@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Timers;
 using PluginAPI.Core;
+using Newtonsoft.Json;
 
 namespace PlayerJoinWelcome.Services
 {
@@ -30,12 +31,12 @@ namespace PlayerJoinWelcome.Services
                     return;
 
                 dataDirectoryPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".plugin-data", "PlayerJoinWelcome");
-                dataFilePath = Path.Combine(dataDirectoryPath, "vip_assignments.txt");
+                dataFilePath = Path.Combine(dataDirectoryPath, "vip_assignments.json");
 
                 Directory.CreateDirectory(dataDirectoryPath);
                 LoadFromDisk();
 
-                expirationTimer = new Timer(60_000);
+                expirationTimer = new Timer(30_000);
                 expirationTimer.AutoReset = true;
                 expirationTimer.Elapsed += (_, __) => ExpireLoop();
                 expirationTimer.Start();
@@ -82,6 +83,12 @@ namespace PlayerJoinWelcome.Services
 
             lock (SyncRoot)
             {
+                if (userIdToAssignment.ContainsKey(player.UserId))
+                {
+                    error = "Player already has a VIP assignment. Remove it first.";
+                    return false;
+                }
+
                 userIdToAssignment[player.UserId] = new VipAssignment
                 {
                     UserId = player.UserId,
@@ -93,6 +100,33 @@ namespace PlayerJoinWelcome.Services
 
             TryApplyBadge(player, rankText);
             return true;
+        }
+
+        public bool TryGetAssignment(string userId, out VipAssignment assignment)
+        {
+            lock (SyncRoot)
+            {
+                return userIdToAssignment.TryGetValue(userId, out assignment);
+            }
+        }
+
+        public bool RemoveForPlayer(Player player)
+        {
+            if (player == null) return false;
+            bool removed;
+            lock (SyncRoot)
+            {
+                removed = userIdToAssignment.Remove(player.UserId);
+                if (removed)
+                {
+                    SaveToDisk();
+                }
+            }
+            if (removed)
+            {
+                ClearBadge(player);
+            }
+            return removed;
         }
 
         public void TryApplyOnJoin(Player player)
@@ -109,11 +143,25 @@ namespace PlayerJoinWelcome.Services
 
             if (assignment.ExpiresAtUtc <= DateTime.UtcNow)
             {
-                // Already expired, clean up on the next loop
+                // Already expired, clean up immediately
+                lock (SyncRoot)
+                {
+                    userIdToAssignment.Remove(player.UserId);
+                    SaveToDisk();
+                }
+                ClearBadge(player);
                 return;
             }
 
             TryApplyBadge(player, assignment.RankText);
+        }
+
+        public void ReapplyForOnlinePlayers()
+        {
+            foreach (var player in Player.GetPlayers())
+            {
+                TryApplyOnJoin(player);
+            }
         }
 
         private void ExpireLoop()
@@ -161,28 +209,14 @@ namespace PlayerJoinWelcome.Services
         {
             try
             {
-                // Use PluginAPI wrapper properties if available
-                try
+                if (player.ReferenceHub != null && player.ReferenceHub.serverRoles != null)
                 {
-                    player.RankName = rankText;
-                    if (string.IsNullOrEmpty(player.RankColor))
-                        player.RankColor = "yellow";
-                    player.RefreshPermissions();
+                    player.ReferenceHub.serverRoles.SetText(rankText);
+                    player.ReferenceHub.serverRoles.SetColor("yellow");
+                    player.ReferenceHub.serverRoles.RefreshPermissions();
                     return;
                 }
-                catch
-                {
-                    // Fallback to serverRoles if direct properties are unavailable
-                    try
-                    {
-                        player.ReferenceHub.serverRoles.SetText(rankText, "yellow");
-                    }
-                    catch
-                    {
-                        // As a last resort just log
-                        Log.Warning($"Could not set badge for {player.Nickname}. RankText={rankText}");
-                    }
-                }
+                Log.Warning($"serverRoles is null for {player.Nickname}; cannot apply badge.");
             }
             catch (Exception ex)
             {
@@ -194,24 +228,14 @@ namespace PlayerJoinWelcome.Services
         {
             try
             {
-                try
+                if (player.ReferenceHub != null && player.ReferenceHub.serverRoles != null)
                 {
-                    player.RankName = string.Empty;
-                    player.RankColor = string.Empty;
-                    player.RefreshPermissions();
+                    player.ReferenceHub.serverRoles.SetText(string.Empty);
+                    player.ReferenceHub.serverRoles.SetColor(string.Empty);
+                    player.ReferenceHub.serverRoles.RefreshPermissions();
                     return;
                 }
-                catch
-                {
-                    try
-                    {
-                        player.ReferenceHub.serverRoles.SetText(string.Empty, string.Empty);
-                    }
-                    catch
-                    {
-                        Log.Warning($"Could not clear badge for {player.Nickname}");
-                    }
-                }
+                Log.Warning($"serverRoles is null for {player.Nickname}; cannot clear badge.");
             }
             catch (Exception ex)
             {
@@ -225,29 +249,20 @@ namespace PlayerJoinWelcome.Services
             if (!File.Exists(dataFilePath))
                 return;
 
-            foreach (var line in File.ReadAllLines(dataFilePath))
+            try
             {
-                var trimmed = line.Trim();
-                if (string.IsNullOrEmpty(trimmed))
-                    continue;
-                if (trimmed.StartsWith("#"))
-                    continue;
-
-                // Format: userId|rankText|expiresAtUtcTicks
-                var parts = trimmed.Split('|');
-                if (parts.Length != 3)
-                    continue;
-
-                if (!long.TryParse(parts[2], out var ticks))
-                    continue;
-
-                var assignment = new VipAssignment
+                var json = File.ReadAllText(dataFilePath);
+                var list = JsonConvert.DeserializeObject<List<VipAssignment>>(json) ?? new List<VipAssignment>();
+                foreach (var a in list)
                 {
-                    UserId = parts[0],
-                    RankText = parts[1],
-                    ExpiresAtUtc = new DateTime(ticks, DateTimeKind.Utc)
-                };
-                userIdToAssignment[assignment.UserId] = assignment;
+                    if (a == null || string.IsNullOrWhiteSpace(a.UserId))
+                        continue;
+                    userIdToAssignment[a.UserId] = a;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Error($"Failed to load VIP assignments: {ex}");
             }
         }
 
@@ -255,18 +270,8 @@ namespace PlayerJoinWelcome.Services
         {
             try
             {
-                var lines = new List<string>
-                {
-                    "# vip_assignments: userId|rankText|expiresAtUtcTicks"
-                };
-
-                foreach (var kvp in userIdToAssignment)
-                {
-                    var a = kvp.Value;
-                    lines.Add($"{a.UserId}|{a.RankText}|{a.ExpiresAtUtc.Ticks}");
-                }
-
-                File.WriteAllLines(dataFilePath, lines);
+                var json = JsonConvert.SerializeObject(userIdToAssignment.Values.ToList(), Formatting.Indented);
+                File.WriteAllText(dataFilePath, json);
             }
             catch (Exception ex)
             {
@@ -274,7 +279,7 @@ namespace PlayerJoinWelcome.Services
             }
         }
 
-        private sealed class VipAssignment
+        public sealed class VipAssignment
         {
             public string UserId { get; set; }
             public string RankText { get; set; }

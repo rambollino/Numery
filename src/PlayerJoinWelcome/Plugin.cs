@@ -13,6 +13,7 @@ namespace PlayerJoinWelcome
         {
             EventManager.RegisterEvents(this);
             VipService.Instance.Initialize();
+            VipService.Instance.ReapplyForOnlinePlayers();
         }
         
         [PluginUnload]
